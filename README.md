@@ -1,6 +1,6 @@
 # Kestrel support ticket triage
 
-A Next.js application that classifies support requests using Gemini through the OpenAI-compatible Chat Completions API. The implementation follows the instructor's Teams F1–F5 feature checklist; the course PDF supplies the API and validation workflow.
+A Next.js application that classifies support requests using Gemini through the OpenAI-compatible Chat Completions API, and a Cloudflare classifier (@cf/cloudflare/clef-flash). The implementation follows the instructor's Teams F1–F5 feature checklist; the course PDF supplies the API and validation workflow.
 
 ## Run locally
 
@@ -8,8 +8,6 @@ Requires Node.js 20.9+ and a Gemini API key with access to the configured models
 
 ```powershell
 npm ci
-Copy-Item .env.example .env.local
-# Edit .env.local and insert your private key.
 npm run dev
 ```
 
@@ -56,7 +54,9 @@ All secrets remain on the server. /api/config returns model IDs only.
 | SMOKE_DELAY_MS               | Delay between tickets; default 4500 ms                 |
 | TRIAGE_STORAGE_DIR           | Optional writable storage root; default project folder |
 
-Prices apply to all configured models: use models with the same configured rates, or update prices before a new run. Set rates to zero only when the API project is confirmed to use free-tier billing. Unknown prices or token usage produce **unavailable**, never an invented zero. A failed request can incur unreported usage; run cost is unavailable if any row has unknown cost.
+Each saved run records the price it was calculated with. The clef-flash runs used $0.038 per million input tokens and $0 per million output tokens, which differs from the Gemini rates. Compare costs only after each model's rate is set correctly for that run.
+
+Set rates to zero only when the API project is confirmed to use free-tier billing. Unknown prices or token usage produce **unavailable**, never an invented zero. A failed request can incur unreported usage; run cost is unavailable if any row has unknown cost.
 
 Gemini access changes over time. A listed model can still be unavailable to your project or quota. Change the allowlist and default using your own accessible model IDs. Restart after environment changes. No automatic paid-tier upgrade is performed.
 
@@ -73,7 +73,7 @@ Browser → route validation → lib/triage.ts → lib/llm.ts → provider → J
 - /api/smoke POST accepts { dataset: "labelled100" | "tickets500", count, model?, replay? } and streams newline-delimited JSON progress events.
 - /api/runs/:id downloads a run.
 
-Input tickets must contain 1–20,000 trimmed characters. Response fields: category (billing/technical_bug/account/feature_request), priority (low/medium/high), summary (1–300 characters), suggested_action (1–500). Extra keys are rejected.
+Input tickets must contain 1–20,000 trimmed characters. Gemini responses contain category (billing/technical_bug/account/feature_request), priority (low/medium/high), summary (1–300 characters) and suggested_action (1–500). Extra keys are rejected. The clef-flash run files record category and priority probabilities, with summary and suggested_action set to null; see the Evaluation section.
 
 A larger bound than 5,000 allows the supplied long tickets while rejecting oversized input before a provider call. Invalid JSON/input returns 400, quota 429, invalid model output/network/provider failures 502, timeout 504, and bad provider configuration 500. No raw provider error reaches the browser.
 
@@ -83,14 +83,34 @@ Timeout: 30 seconds per SDK attempt; one SDK retry for transient errors. Malform
 
 Accuracy denominator = all **processed labelled tickets**, including failures. A failed call counts as both a category and priority mismatch. Unprocessed tickets are excluded and the processed/requested counts remain visible. The 500 set has no accuracy labels. Confusion matrices include a "(failed)" prediction column.
 
-Real verification on 2026-10-24, identical random sample of 5 labelled tickets:
+### Gemini comparison, 5 labelled tickets
 
-| Model                 | Successful | Category accuracy | Priority accuracy | Mean latency | Estimated USD             |
-| --------------------- | ---------- | ----------------- | ----------------- | ------------ | ------------------------- |
-| gemini-3.5-flash-lite | 5/5        | 80%               | 100%              | 7.35 s       | 0 (configured free tier)  |
-| gemini-3.1-flash-lite | 4/5        | 60%               | 60%               | 15.12 s      | unavailable (one timeout) |
+Both runs were made on 2026-10-24 and 2026-10-25 respectively. They used different samples: the 3.5 run included TCK-10322 and TCK-10358, and the 3.1 run included TCK-10323 and TCK-10359 in their places. The other three tickets were shared.
 
-Three observations: 3.5 completed all calls while 3.1 timed out once; 3.5 was faster in this run; 3.5 agreed more often with labels on this small sample. This is a smoke test, not an unbiased model benchmark. One account-vs-bug disagreement occurred on both models and should be investigated before changing the prompt. The one-ticket 500-set run also succeeded. Full evidence is in runs/ and output/live-verification.json.
+| Model                 | Successful | Category accuracy | Priority accuracy | Mean latency                                           | Estimated USD                 |
+| --------------------- | ---------- | ----------------- | ----------------- | ------------------------------------------------------ | ----------------------------- |
+| gemini-3.5-flash-lite | 5/5        | 80%               | 100%              | 7.35 s                                                 | 0 (configured free tier)      |
+| gemini-3.1-flash-lite | 4/5        | 60%               | 60%               | 15.12 s including timeout; 3.78 s for successful calls | unavailable (one timeout)     |
+
+### clef-flash runs
+
+| Run      | Tickets                                   | Successful | Category accuracy | Priority accuracy | Mean latency | Estimated USD |
+| -------- | ----------------------------------------- | ---------- | ----------------- | ----------------- | ------------ | ------------- |
+| 2853ecc4 | 5 labelled                                | 5/5        | 80%               | 100%              | 524 ms       | $0.0000788    |
+| 873bf026 | Same 5 tickets (repeat run)               | 5/5        | 80%               | 100%              | 1,007 ms     | $0.0000788    |
+| 758c7342 | 100 labelled, complete                    | 100/100    | 91%               | 67%               | 510 ms       | $0.00184      |
+| ee61c595 | 100 requested, 98 processed (interrupted) | 98/98      | 91%               | 66%               | 453 ms       | $0.00181      |
+
+The two 5-ticket clef runs returned identical predictions and are counted as one result. The interrupted 100-ticket run did not record a stop reason; TCK-10162 and TCK-10256, the last two tickets in its sample, have no row.
+
+### Observations
+
+- The Gemini 3.1 run had one timeout (TCK-10036, a prompt-injection test ticket) and was slower on the calls that succeeded. The 3.5 run completed every call.
+- Both Gemini runs disagreed with the labels on one account ticket, classifying it as technical_bug. The clef-flash run made the same mistake on its account ticket.
+- On the complete 100-ticket clef run, priority was the weaker field: 33 of 100 priorities disagreed with the labels, against 9 category disagreements.
+- These are small or single-run samples. They are smoke tests, not an unbiased model benchmark. Run each model on the same sample before drawing conclusions about which is better.
+
+Full evidence is in runs/ and output/live-verification.json.
 
 ## Verification
 
@@ -98,7 +118,6 @@ Three observations: 3.5 completed all calls while 3.1 timed out once; 3.5 was fa
 npm run typecheck
 npm run build
 npm test
-# Optional: sends real calls using .env.local (12 calls before retries).
 npm run test:live
 ```
 
@@ -117,6 +136,8 @@ npm run build and the integration suite passed. The browser was also checked for
 - [x] Controlled errors and explicit bounded retries/timeouts.
 - [x] Fixed a real validation gap: empty conversations and client-supplied system roles are rejected in the chat exercise.
 - [x] Saved evidence distinguishes actual calls from mocked tests.
+- [ ] Same-sample comparison between models has not yet been run.
+- [ ] The interrupted clef-flash run (ee61c595) has no recorded stop reason.
 
 This is a **local classroom app** with filesystem storage. It has no authentication; do not expose its admin and model-calling endpoints publicly without adding access controls and rate limits. A writable persistent disk is required; ephemeral serverless storage is unsuitable. A killed server may leave the last checkpoint marked running; rows already saved remain available. Large samples can exceed hosting time limits. Prompt-injection resistance is not guaranteed by schema validation: schemas enforce shape, not semantic correctness. Human review remains necessary.
 
@@ -124,12 +145,9 @@ This is a **local classroom app** with filesystem storage. It has no authenticat
 
 Features were developed as stacked branches so every later branch includes the preceding features:
 
-1. F1/Structured-Triage-Flow
-2. codex/f2-token-usage
-3. codex/f3-smoke-runner
-4. codex/f4-run-history
-5. codex/f5-model-comparison
-6. codex/submission-verification (integrated submission)
+1. f1/structured-triage-flow
+2. feat/token-usage
+3. feat/smoke-runner
 
 Each feature has a dedicated commit. The verification branch includes final tests, documentation and real run evidence. The unrelated existing test.py is not part of the submission changes.
 
